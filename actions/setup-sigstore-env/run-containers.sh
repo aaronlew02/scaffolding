@@ -16,6 +16,22 @@
 
 # <cmd> || return is so the script can exit early without quitting your shell.
 
+START_FULCIO=true
+START_REKOR=true
+START_TSA=true
+START_REKOR_TILES=true
+
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --no-fulcio) START_FULCIO=false; ;;
+    --no-rekor) START_REKOR=false; ;;
+    --no-tsa) START_TSA=false; ;;
+    --no-rekor-tiles) START_REKOR_TILES=false; ;;
+    *) echo "Unknown parameter passed: $1"; exit 1 ;;
+  esac
+  shift
+done
+
 CLONE_DIR="${CLONE_DIR:-$(mktemp -d)}"
 CWD="$(pwd)"
 
@@ -43,16 +59,19 @@ popd || return
 
 echo "downloading service repos"
 pushd "$CLONE_DIR" || return
-FULCIO_REPO="${FULCIO_REPO:-sigstore/fulcio}"
-REKOR_REPO="${REKOR_REPO:-sigstore/rekor}"
-TIMESTAMP_AUTHORITY_REPO="${TIMESTAMP_AUTHORITY_REPO:-sigstore/timestamp-authority}"
-REKOR_TILES_REPO="${REKOR_TILES_REPO:-sigstore/rekor-tiles}"
-OWNER_REPOS=(
-  "$FULCIO_REPO"
-  "$REKOR_REPO"
-  "$TIMESTAMP_AUTHORITY_REPO"
-  "$REKOR_TILES_REPO"
-)
+OWNER_REPOS=()
+if [ "$START_FULCIO" = true ]; then
+    OWNER_REPOS+=("${FULCIO_REPO:-sigstore/fulcio}")
+fi
+if [ "$START_REKOR" = true ]; then
+    OWNER_REPOS+=("${REKOR_REPO:-sigstore/rekor}")
+fi
+if [ "$START_TSA" = true ]; then
+    OWNER_REPOS+=("${TIMESTAMP_AUTHORITY_REPO:-sigstore/timestamp-authority}")
+fi
+if [ "$START_REKOR_TILES" = true ]; then
+    OWNER_REPOS+=("${REKOR_TILES_REPO:-sigstore/rekor-tiles}")
+fi
 procs=${#OWNER_REPOS[@]}
 for owner_repo in "${OWNER_REPOS[@]}"; do
     repo=$(basename "$owner_repo")
@@ -98,6 +117,7 @@ stop_services() {
 
 echo "building trusted root"
 pushd "$CLONE_DIR" || return
+# TODO: Disable curl test in build-trusted-root.sh for non-configured services.
 "$CWD"/build-trusted-root.sh \
   --fulcio http://localhost:5555 "$CLONE_DIR/fulcio/config/ctfe/pubkey.pem" \
   --timestamp-url http://localhost:3004 \
