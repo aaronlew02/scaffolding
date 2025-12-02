@@ -15,97 +15,84 @@
 # limitations under the License.
 
 # <cmd> || return is so the script can exit early without quitting your shell.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  return() { exit "${1:-$?}"; }
+fi
 
-CLONE_DIR="${CLONE_DIR:-$(mktemp -d)}"
+START_FULCIO=true
+START_REKOR=true
+START_TSA=true
+START_REKOR_TILES=true
+
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --no-fulcio) START_FULCIO=false; ;;
+    --no-rekor) START_REKOR=false; ;;
+    --no-tsa) START_TSA=false; ;;
+    --no-rekor-tiles) START_REKOR_TILES=false; ;;
+    *) echo "Unknown parameter passed: $1"; exit 1 ;;
+  esac
+  shift
+done
+
+TEMP_DIR="${TEMP_DIR:-$(mktemp -d)}"
 CWD="$(pwd)"
 
-echo "setting up OIDC provider"
-pushd ./fakeoidc || return
-docker compose up --wait --build
-# Tokens will be created with this URL as the token issuer, so that Fulcio can make
-# requests to the fakeoidc container running in Fulcio's network,
-# which will be created later on.
-export ISSUER_URL="http://fakeoidc:8080"
-export OIDC_URL="http://localhost:8080"
-export FULCIO_CONFIG=$CLONE_DIR/fulcio-config.json
-cat <<EOF > "$FULCIO_CONFIG"
-{
-  "OIDCIssuers": {
-    "$ISSUER_URL": {
-      "IssuerURL": "$ISSUER_URL",
-      "ClientID": "sigstore",
-      "Type": "email"
-    }
-  }
-}
-EOF
-popd || return
-
-echo "downloading service repos"
-pushd "$CLONE_DIR" || return
-FULCIO_REPO="${FULCIO_REPO:-sigstore/fulcio}"
-REKOR_REPO="${REKOR_REPO:-sigstore/rekor}"
-TIMESTAMP_AUTHORITY_REPO="${TIMESTAMP_AUTHORITY_REPO:-sigstore/timestamp-authority}"
-REKOR_TILES_REPO="${REKOR_TILES_REPO:-sigstore/rekor-tiles}"
-OWNER_REPOS=(
-  "$FULCIO_REPO"
-  "$REKOR_REPO"
-  "$TIMESTAMP_AUTHORITY_REPO"
-  "$REKOR_TILES_REPO"
-)
-procs=${#OWNER_REPOS[@]}
-for owner_repo in "${OWNER_REPOS[@]}"; do
-    repo=$(basename "$owner_repo")
-    if [[ ! -d $repo ]]; then
-        echo "'git clone https://github.com/${owner_repo}.git'"
-    else
-        echo "'cd $repo && git pull'"
-    fi
-done | xargs -P "$procs" -L1 bash -c
-export CT_LOG_KEY="$CLONE_DIR/fulcio/config/ctfe/pubkey.pem"
+SERVICES_TO_START=()
+SERVICES_TO_START+=("fakeoidc")
+if [ "$START_FULCIO" = true ]; then
+  SERVICES_TO_START+=("fulcio-server" "ct-server" "dex-idp")
+fi
+if [ "$START_REKOR" = true ]; then
+  SERVICES_TO_START+=("rekor-server" "trillian-log-server" "trillian-log-signer" "mysql" "redis-server")
+fi
+if [ "$START_REKOR_TILES" = true ]; then
+  SERVICES_TO_START+=("rekor-tiles" "spanner" "gcs" "witness" "rekor_init")
+fi
+if [ "$START_TSA" = true ]; then
+  SERVICES_TO_START+=("timestamp-server")
+fi
 
 echo "starting services"
-export FULCIO_METRICS_PORT=2113
-for owner_repo in "${OWNER_REPOS[@]}"; do
-    repo=$(basename "$owner_repo")
-    echo "'cd $repo && docker compose up --wait'"
-done | xargs -P "$procs" -L1 bash -c
-# The fakeoidc service is in a separate Docker network. Connect the fakeoidc container to the Fulcio
-# network to enable Fulcio to reach it for token verification.
-docker network inspect fulcio_default | grep fakeoidc || docker network connect --alias fakeoidc fulcio_default fakeoidc || return
-export TSA_URL="http://localhost:3004"
-popd || return
+UNIQUE_SERVICES=($(echo "${SERVICES_TO_START[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+if [ ${#UNIQUE_SERVICES[@]} -gt 0 ]; then
+  echo "Starting services: ${UNIQUE_SERVICES[@]}"
+  docker compose up --wait "${UNIQUE_SERVICES[@]}"
+else
+  echo "No services to start."
+fi
 
-export OIDC_TOKEN="$CLONE_DIR"/token
+export ISSUER_URL="http://fakeoidc:8080"
+export OIDC_URL="http://localhost:8080"
+export CT_LOG_KEY="$CWD/config/fulcio/ctfe/pubkey.pem"
+
+export OIDC_TOKEN="$TEMP_DIR"/token
 curl -o "$OIDC_TOKEN" "$OIDC_URL/token" || return
 # Cosign's OIDC provider will use this environment variable to get the OIDC token.
 SIGSTORE_ID_TOKEN="$(cat "$OIDC_TOKEN")"
 export SIGSTORE_ID_TOKEN
 
 stop_services() {
-  pushd ./fakeoidc || return
   docker compose down --volumes
-  popd || return
-  pushd "$CLONE_DIR" || return
-  for owner_repo in "${OWNER_REPOS[@]}"; do
-    repo=$(basename "$owner_repo")
-    pushd "$repo" || return
-    docker compose down --volumes
-    popd || return
-  done
-  popd || return
 }
 
 echo "building trusted root"
-pushd "$CLONE_DIR" || return
-"$CWD"/build-trusted-root.sh \
-  --fulcio http://localhost:5555 "$CLONE_DIR/fulcio/config/ctfe/pubkey.pem" \
-  --timestamp-url http://localhost:3004 \
-  --oidc-url http://localhost:8080 \
-  --rekor-v1-url http://localhost:3000 \
-  --rekor-v2 http://localhost:3003 "$CLONE_DIR/rekor-tiles/tests/testdata/pki/ed25519-pub-key.pem" "rekor-local" \
-  || return
-export TRUSTED_ROOT="$CLONE_DIR/trusted_root.json"
-export SIGNING_CONFIG="$CLONE_DIR/signing_config.json"
-export TRUST_CONFIG="$CLONE_DIR/trust_config.json"
+pushd "$TEMP_DIR" || return
+BUILD_CMD=("$CWD/build-trusted-root.sh" --oidc-url http://localhost:8080)
+if [ "$START_FULCIO" = true ]; then
+  BUILD_CMD+=(--fulcio http://localhost:5555 "$CWD/config/fulcio/ctfe/pubkey.pem")
+fi
+if [ "$START_TSA" = true ]; then
+  BUILD_CMD+=(--timestamp-url http://localhost:3004)
+fi
+if [ "$START_REKOR" = true ]; then
+  BUILD_CMD+=(--rekor-v1-url http://localhost:3000)
+fi
+if [ "$START_REKOR_TILES" = true ]; then
+  BUILD_CMD+=(--rekor-v2 http://localhost:3003 "$CWD/config/rekor-tiles/pki/ed25519-pub-key.pem" "rekor-local")
+fi
+"${BUILD_CMD[@]}" || return
+export TRUSTED_ROOT="$TEMP_DIR/trusted_root.json"
+export SIGNING_CONFIG="$TEMP_DIR/signing_config.json"
+export TRUST_CONFIG="$TEMP_DIR/trust_config.json"
 popd || return

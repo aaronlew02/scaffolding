@@ -1,0 +1,255 @@
+# Copyright 2025 The Sigstore Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  fakeoidc:
+    build:
+      context: ./fakeoidc
+    restart: always
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: [ "CMD", "wget", "-O", "/dev/null", "http://localhost:8080/.well-known/openid-configuration" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  mysql:
+    platform: linux/amd64
+    image: gcr.io/trillian-opensource-ci/db_server:v1.4.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=zaphod
+      - MYSQL_DATABASE=test
+      - MYSQL_USER=test
+      - MYSQL_PASSWORD=zaphod
+    restart: always
+    healthcheck:
+      test: "mysqladmin -h 127.0.0.1 --user=$$MYSQL_USER --password=$$MYSQL_ROOT_PASSWORD -s ping"
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 90s
+
+  redis-server:
+    image: redis:6.2
+    command: [ "--bind", "0.0.0.0", "--appendonly", "yes", "--requirepass", "test" ]
+    ports:
+      - "6379:6379"
+    restart: always
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "test", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  trillian-log-server:
+    image: ghcr.io/sigstore/rekor/trillian_log_server:v1.3.4
+    command: [ "--quota_system=noop", "--storage_system=mysql", "--mysql_uri=test:zaphod@tcp(mysql:3306)/test", "--rpc_endpoint=0.0.0.0:8090", "--http_endpoint=0.0.0.0:8091", "--alsologtostderr" ]
+    restart: always
+    ports:
+      - "8090:8090"
+      - "8091:8091"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  trillian-log-signer:
+    image: ghcr.io/sigstore/rekor/trillian_log_signer:v1.3.4
+    command: [ "--quota_system=noop", "--storage_system=mysql", "--mysql_uri=test:zaphod@tcp(mysql:3306)/test", "--rpc_endpoint=0.0.0.0:8090", "--http_endpoint=0.0.0.0:8091", "--force_master", "--alsologtostderr" ]
+    restart: always
+    ports:
+      - "8092:8091"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  rekor-server:
+    image: ghcr.io/sigstore/rekor/rekor-server:v1.4.2
+    environment:
+      - TMPDIR=/var/run/attestations
+    command: [ "serve", "--trillian_log_server.address=trillian-log-server", "--trillian_log_server.port=8090", "--rekor_server.address=0.0.0.0", "--rekor_server.signer=memory", "--enable_attestation_storage", "--attestation_storage_bucket=file:///var/run/attestations", "--search_index.storage_provider=mysql", "--search_index.mysql.dsn=test:zaphod@tcp(mysql:3306)/test" ]
+    volumes:
+      - "/var/run/attestations:/var/run/attestations:z"
+    restart: always
+    ports:
+      - "3000:3000"
+      - "2112:2112"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      trillian-log-server:
+        condition: service_started 
+
+  fulcio-server:
+    image: ghcr.io/sigstore/fulcio:v1.8.2
+    command: [ "serve", "--host=0.0.0.0", "--port=5555", "--grpc-port=5554", "--ca=fileca", "--fileca-cert=/etc/fulcio/root.pem", "--fileca-key=/etc/fulcio/root.key", "--fileca-key-passwd=fulcio", "--ct-log-url=http://ct-server:6962" ]
+    restart: always
+    ports:
+      - "5555:5555"
+      - "5554:5554"
+      - "${FULCIO_METRICS_PORT:-2113}:2112"
+    volumes:
+      - ~/.config/gcloud:/root/.config/gcloud/:z
+      - ./config/fulcio/identity/config.yaml:/etc/fulcio-config/config.yaml:z
+      - ./config/fulcio/fulcio-root:/etc/fulcio:ro
+    depends_on:
+      dex-idp:
+        condition: service_healthy
+
+  dex-idp:
+    image: ghcr.io/dexidp/dex:v2.30.2
+    user: root
+    command: [ "dex", "serve", "/etc/config/docker-compose-config.yaml" ]
+    restart: always
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./config/dex/config.yaml:/etc/config/docker-compose-config.yaml:z
+    healthcheck:
+      test: [ "CMD", "wget", "-O", "/dev/null", "http://localhost:8888/auth/healthz" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  ct-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.tesseract
+    volumes:
+      - ctStorage:/ctfe:z
+      - ./config/fulcio/ctfe/:/etc/ctfe:ro
+      - ./config/fulcio/fulcio-root:/etc/fulcio:ro
+    user: root
+    command: [ "--private_key", "/etc/ctfe/privkey.pem", "--origin", "tesseract", "--storage_dir", "/ctfe", "--roots_pem_file", "/etc/fulcio/root.pem", "--v", "1", "--ext_key_usages", "CodeSigning", "--http_endpoint", "0.0.0.0:6962" ]
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "-k", "http://localhost:6962/healthz" ]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
+    restart: always
+    ports:
+      - "6962:6962"
+
+  timestamp-server:
+    image: ghcr.io/sigstore/timestamp-server:v1.2.8
+    command: [ "serve", "--host=0.0.0.0", "--port=3004", "--timestamp-signer=memory" ]
+    restart: always
+    ports:
+      - "3004:3004"
+      - "2115:2112"
+  spanner:
+    image: gcr.io/cloud-spanner-emulator/emulator:1.5.43
+    ports:
+      - "9010:9010"
+      - "9020:9020"
+
+  gcs:
+    image: fsouza/fake-gcs-server:1.52.3
+    volumes:
+      - bucket:/data/tiles:rw
+    command:
+      - "-scheme=http"
+      - "-port=7080"
+      - "-public-host=localhost:7080"
+    ports:
+      - "7080:7080"
+
+  rekor_init:
+    platform: linux/amd64
+    image: google/cloud-sdk:alpine
+    volumes:
+      - ./config/rekor-tiles/scripts/createdb.sh:/scripts/createdb.sh
+    environment:
+      - GCP_PROJECT=rekor-tiles-e2e
+      - SPANNER_INSTANCE=rekor-tiles
+      - SPANNER_DB=sequencer
+      - SPANNER_EMULATOR_REST_HOST=http://spanner:9020/
+      - SPANNER_EMULATOR_HOST=spanner:9010
+    entrypoint: [ "/bin/bash", "/scripts/createdb.sh" ]
+    depends_on:
+      - spanner
+      - gcs
+
+  rekor-tiles:
+    build:
+      context: https://github.com/sigstore/rekor-tiles.git#main
+      dockerfile: Dockerfile
+    environment:
+      - SPANNER_EMULATOR_HOST=spanner:9010
+      - STORAGE_EMULATOR_HOST=gcs:7080
+    command:
+      - "rekor-server"
+      - "serve"
+      - "--http-address=0.0.0.0"
+      - "--grpc-address=0.0.0.0"
+      - "--hostname=rekor-local"
+      - "--gcp-bucket=tiles"
+      - "--gcp-spanner=projects/rekor-tiles-e2e/instances/rekor-tiles/databases/sequencer"
+      - "--signer-filepath=/pki/ed25519-priv-key.pem"
+      - "--checkpoint-interval=2s"
+      - "--log-level=debug"
+      - "--request-response-logging=true"
+      - "--persistent-antispam"
+      - "--witness-policy-path=/witness/policy.yaml"
+    ports:
+      - "3003:3000" # http port
+      - "3001:3001" # grpc port
+      - "2114:2112" # metrics port
+    healthcheck:
+      test: [ "CMD-SHELL", "curl http://localhost:3000/healthz | grep '{\"status\":\"SERVING\"}'" ]
+      timeout: 30s
+      retries: 10
+      interval: 3s
+    volumes:
+      - ./config/rekor-tiles/pki:/pki
+      - ./config/rekor-tiles/witness:/witness
+    depends_on:
+      rekor_init:
+        condition: service_completed_successfully
+      witness:
+        condition: service_healthy
+
+  witness:
+    build:
+      context: https://github.com/transparency-dev/witness.git#main
+      dockerfile: cmd/omniwitness/Dockerfile
+    volumes:
+      - witness_data:/witness_data:rw
+      - ./config/rekor-tiles/witness:/witness_config
+    command:
+      - "--listen=:8100"
+      - "--db_file=/witness_data/witness.sqlite"
+      - "--private_key=PRIVATE+KEY+rekor-witness-test+a478f5cd+AT5yCADn4hz2PNT790E8q7VkAXuBdy+HFv9tP0qvKyFV"
+      - "--additional_logs=/witness_config/config.yaml"
+      - "--poll_interval=0"
+      - "--logtostderr"
+      - "--v=2"
+    restart: always
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -O - http://localhost:8081/metrics || exit 1" ]
+      timeout: 30s
+      retries: 10
+      interval: 3s
+    ports:
+      - "8100:8100"
+      - "8081:8081"
+
+volumes:
+  ctStorage: {}
+  bucket: {}
+  witness_data: {}
